@@ -2,29 +2,36 @@ package com.thinkaurelius.titan.diskstorage.cassandra.thrift;
 
 import javax.annotation.Nullable;
 
+import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
+import com.netflix.astyanax.connectionpool.HostConnectionPool;
+import com.netflix.astyanax.connectionpool.impl.TokenHostConnectionPoolPartition;
+import com.netflix.astyanax.connectionpool.impl.TokenSmartConnectionPoolImpl.Counter;
 import com.thinkaurelius.titan.diskstorage.PermanentStorageException;
 import com.thinkaurelius.titan.diskstorage.StorageException;
 import com.thinkaurelius.titan.diskstorage.TemporaryStorageException;
 import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnection;
+import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnectionPool;
 import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.UncheckedGenericKeyedObjectPool;
 import com.thinkaurelius.titan.diskstorage.keycolumnvalue.*;
-import com.thinkaurelius.titan.diskstorage.keycolumnvalue.KCVMutation;
 import com.thinkaurelius.titan.diskstorage.util.ByteBufferUtil;
 import org.apache.cassandra.dht.*;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.thrift.ConsistencyLevel;
 import org.apache.commons.lang.ArrayUtils;
 import org.apache.thrift.TException;
+import org.cliffc.high_scale_lib.NonBlockingHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static com.thinkaurelius.titan.diskstorage.cassandra.CassandraTransaction.getTx;
 
@@ -43,14 +50,11 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
     private final CassandraThriftStoreManager storeManager;
     private final String keyspace;
     private final String columnFamily;
-    private final UncheckedGenericKeyedObjectPool<String, CTConnection> pool;
-
-    public CassandraThriftKeyColumnValueStore(String keyspace, String columnFamily, CassandraThriftStoreManager storeManager,
-                                              UncheckedGenericKeyedObjectPool<String, CTConnection> pool) {
+    
+    public CassandraThriftKeyColumnValueStore(String keyspace, String columnFamily, CassandraThriftStoreManager storeManager) {
         this.storeManager = storeManager;
         this.keyspace = keyspace;
         this.columnFamily = columnFamily;
-        this.pool = pool;
     }
 
     /**
@@ -110,6 +114,7 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
 
 
         CTConnection conn = null;
+        UncheckedGenericKeyedObjectPool<String, CTConnection> pool = storeManager.getPool();
         try {
             conn = pool.genericBorrowObject(keyspace);
             Cassandra.Client client = conn.getClient();
@@ -128,6 +133,9 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
 
                 result.add(new Entry(c.bufferForName(), c.bufferForValue()));
             }
+            
+            // TODO update StorageManager counter for this key
+            
             return result;
         } catch (Exception e) {
             throw convertException(e);
@@ -154,6 +162,7 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
         range.setFinish(empty);
         predicate.setSlice_range(range);
         CTConnection conn = null;
+        CTConnectionPool pool = storeManager.getPool();
         try {
             conn = pool.genericBorrowObject(keyspace);
             Cassandra.Client client = conn.getClient();
@@ -163,7 +172,7 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
             throw convertException(e);
         } finally {
             if (null != conn)
-                pool.genericReturnObject(keyspace, conn);
+                .genericReturnObject(keyspace, conn);
         }
     }
 
@@ -353,4 +362,6 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
             return (row == null) ? false : row.getColumns().size() > 0;
         }
     }
+
+
 }

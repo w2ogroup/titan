@@ -1,10 +1,11 @@
 package com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool;
 
-import com.google.common.base.Joiner;
-import com.google.common.collect.Iterators;
-import com.thinkaurelius.titan.diskstorage.PermanentStorageException;
-import com.thinkaurelius.titan.diskstorage.StorageException;
-import com.thinkaurelius.titan.diskstorage.TemporaryStorageException;
+import java.nio.ByteBuffer;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
+
 import org.apache.cassandra.db.marshal.TimeUUIDType;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.thrift.Cassandra;
@@ -19,10 +20,11 @@ import org.apache.thrift.transport.TTransportException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.ByteBuffer;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import com.google.common.base.Joiner;
+import com.google.common.collect.Iterators;
+import com.thinkaurelius.titan.diskstorage.PermanentStorageException;
+import com.thinkaurelius.titan.diskstorage.StorageException;
+import com.thinkaurelius.titan.diskstorage.TemporaryStorageException;
 
 /**
  * A factory compatible with Apache commons-pool for Cassandra Thrift API
@@ -31,20 +33,14 @@ import java.util.UUID;
  * @author Dan LaRocque <dalaro@hopcount.org>
  */
 public class CTConnectionFactory implements KeyedPoolableObjectFactory {
+	
     private static final Logger log = LoggerFactory.getLogger(CTConnectionFactory.class);
 
-    private final String hostname;
-    private final int port;
-    private final int timeoutMS;
-    private final int frameSize;
-    private final int maxMessageSize;
+    private AtomicReference<Config> cfgRef;    
 
-    CTConnectionFactory(String hostname, int port, int timeoutMS, int frameSize, int maxMessageSize) {
-        this.hostname = hostname;
-        this.port = port;
-        this.timeoutMS = timeoutMS;
-        this.frameSize = frameSize;
-        this.maxMessageSize = maxMessageSize;
+    public CTConnectionFactory(String hostname, int port, int timeoutMS, int frameSize, int maxMessageSize) {
+		this.cfgRef = new AtomicReference<Config>(new Config(hostname, port,
+				timeoutMS, frameSize, maxMessageSize));
     }
 
     @Override
@@ -80,19 +76,21 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
      * @return A CTConnection ready to talk to a Cassandra cluster
      * @throws TTransportException on any Thrift transport failure
      */
-    public CTConnection makeRawConnection() throws TTransportException {
-        log.debug("Creating TSocket({}, {}, {})", new Object[]{hostname, port, timeoutMS});
+    private CTConnection makeRawConnection() throws TTransportException {
+    	Config cfg = cfgRef.get();
+    	
+        log.debug("Creating TSocket({}, {}, {})", new Object[]{cfg.hostname, cfg.port, cfg.timeoutMS});
 
-        TTransport transport = new TFramedTransport(new TSocket(hostname, port, timeoutMS), frameSize);
+        TTransport transport = new TFramedTransport(new TSocket(cfg.hostname, cfg.port, cfg.timeoutMS), cfg.frameSize);
         TBinaryProtocol protocol = new TBinaryProtocol(transport);
 
-        protocol.setReadLength(maxMessageSize);
+        protocol.setReadLength(cfg.maxMessageSize);
 
         Cassandra.Client client = new Cassandra.Client(protocol);
 
         transport.open();
 
-        return new CTConnection(transport, client);
+        return new CTConnection(transport, client, cfg);
     }
 
     @Override
@@ -100,35 +98,22 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
         // Do nothing, as in activateObject
     }
 
+    /**
+     * Returns true if the connection's config is still up-to-date.
+     */
     @Override
     public boolean validateObject(Object key, Object o) {
         CTConnection conn = (CTConnection) o;
-        String keyspace = (String) key;
-
-        // TODO maybe actually check the keyspace?
-
-        if (conn.getTransport().isOpen()) {
-            try {
-                conn.getClient().set_keyspace(keyspace);
-                return true;
-            } catch (Exception e) {
-                log.debug("Invalidating pooled thrift connection {}", conn);
-            }
-        }
-        return false;
-
-        // Too expensive?
-//		try {
-//			Cassandra.Client client = conn.getClient();
-//			client.describe_keyspace("system");
-//			return true;
-//		} catch (NotFoundException e) {
-//			return false;
-//		} catch (InvalidRequestException e) {
-//			return false;
-//		} catch (TException e) {
-//			return false;
-//		}
+        
+        return conn.getConfig().equals(cfgRef.get());
+    }
+    
+    public Config getConfig() {
+    	return cfgRef.get();
+    }
+    
+    public void setConfig(Config newCfg) {
+    	cfgRef.set(newCfg);
     }
 
     /* This method was adapted from cassandra 0.7.5 cli/CliClient.java */
@@ -261,9 +246,42 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
         }
         throw new PermanentStorageException("Could not verify Cassandra cluster size");
     }
+    
+    public static class Config {
+        private final String hostname;
+        private final int port;
+        private final int timeoutMS;
+        private final int frameSize;
+        private final int maxMessageSize;
+        
+		public Config(String hostname, int port, int timeoutMS, int frameSize,
+				int maxMessageSize) {
+			this.hostname = hostname;
+			this.port = port;
+			this.timeoutMS = timeoutMS;
+			this.frameSize = frameSize;
+			this.maxMessageSize = maxMessageSize;
+		}
 
-    int getTimeoutMS() {
-        return timeoutMS;
+		public String getHostname() {
+			return hostname;
+		}
+
+		public int getPort() {
+			return port;
+		}
+
+		public int getTimeoutMS() {
+			return timeoutMS;
+		}
+
+		public int getFrameSize() {
+			return frameSize;
+		}
+
+		public int getMaxMessageSize() {
+			return maxMessageSize;
+		}
     }
 }
 

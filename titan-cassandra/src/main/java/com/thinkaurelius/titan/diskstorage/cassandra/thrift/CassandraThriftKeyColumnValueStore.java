@@ -1,39 +1,59 @@
 package com.thinkaurelius.titan.diskstorage.cassandra.thrift;
 
+import static com.thinkaurelius.titan.diskstorage.cassandra.CassandraTransaction.getTx;
+
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+
 import javax.annotation.Nullable;
 
-import com.google.common.base.Objects;
+import org.apache.cassandra.dht.BigIntegerToken;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.LongToken;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.thrift.Cassandra;
+import org.apache.cassandra.thrift.Column;
+import org.apache.cassandra.thrift.ColumnOrSuperColumn;
+import org.apache.cassandra.thrift.ColumnParent;
+import org.apache.cassandra.thrift.ColumnPath;
+import org.apache.cassandra.thrift.ConsistencyLevel;
+import org.apache.cassandra.thrift.InvalidRequestException;
+import org.apache.cassandra.thrift.KeyRange;
+import org.apache.cassandra.thrift.KeySlice;
+import org.apache.cassandra.thrift.NotFoundException;
+import org.apache.cassandra.thrift.SlicePredicate;
+import org.apache.cassandra.thrift.SliceRange;
+import org.apache.cassandra.thrift.TimedOutException;
+import org.apache.cassandra.thrift.UnavailableException;
+import org.apache.commons.lang.ArrayUtils;
+import org.apache.thrift.TException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterators;
-import com.netflix.astyanax.connectionpool.HostConnectionPool;
-import com.netflix.astyanax.connectionpool.impl.TokenHostConnectionPoolPartition;
-import com.netflix.astyanax.connectionpool.impl.TokenSmartConnectionPoolImpl.Counter;
 import com.thinkaurelius.titan.diskstorage.PermanentStorageException;
 import com.thinkaurelius.titan.diskstorage.StorageException;
 import com.thinkaurelius.titan.diskstorage.TemporaryStorageException;
 import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnection;
 import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnectionPool;
-import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.UncheckedGenericKeyedObjectPool;
-import com.thinkaurelius.titan.diskstorage.keycolumnvalue.*;
+import com.thinkaurelius.titan.diskstorage.keycolumnvalue.Entry;
+import com.thinkaurelius.titan.diskstorage.keycolumnvalue.KCVMutation;
+import com.thinkaurelius.titan.diskstorage.keycolumnvalue.KeyColumnValueStore;
+import com.thinkaurelius.titan.diskstorage.keycolumnvalue.KeySliceQuery;
+import com.thinkaurelius.titan.diskstorage.keycolumnvalue.RecordIterator;
+import com.thinkaurelius.titan.diskstorage.keycolumnvalue.StoreTransaction;
 import com.thinkaurelius.titan.diskstorage.util.ByteBufferUtil;
-import org.apache.cassandra.dht.*;
-import org.apache.cassandra.thrift.*;
-import org.apache.cassandra.thrift.ConsistencyLevel;
-import org.apache.commons.lang.ArrayUtils;
-import org.apache.thrift.TException;
-import org.cliffc.high_scale_lib.NonBlockingHashMap;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.math.BigInteger;
-import java.nio.ByteBuffer;
-import java.util.*;
-import java.util.concurrent.atomic.AtomicReference;
-
-import static com.thinkaurelius.titan.diskstorage.cassandra.CassandraTransaction.getTx;
 
 /**
  * A Titan {@code KeyColumnValueStore} backed by Cassandra.
@@ -114,7 +134,7 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
 
 
         CTConnection conn = null;
-        UncheckedGenericKeyedObjectPool<String, CTConnection> pool = storeManager.getPool();
+        CTConnectionPool pool = storeManager.getPool();
         try {
             conn = pool.genericBorrowObject(keyspace);
             Cassandra.Client client = conn.getClient();
@@ -134,14 +154,14 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
                 result.add(new Entry(c.bufferForName(), c.bufferForValue()));
             }
             
-            // TODO update StorageManager counter for this key
+            storeManager.updateCounter(query.getKey());
             
             return result;
         } catch (Exception e) {
             throw convertException(e);
         } finally {
             if (null != conn)
-                pool.genericReturnObject(keyspace, conn);
+            	pool.genericReturnObject(keyspace, conn);
         }
     }
 
@@ -167,12 +187,13 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
             conn = pool.genericBorrowObject(keyspace);
             Cassandra.Client client = conn.getClient();
             List<?> result = client.get_slice(key, parent, predicate, consistency);
+            storeManager.updateCounter(key);
             return 0 < result.size();
         } catch (Exception e) {
             throw convertException(e);
         } finally {
             if (null != conn)
-                .genericReturnObject(keyspace, conn);
+                pool.genericReturnObject(keyspace, conn);
         }
     }
 
@@ -183,11 +204,13 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
         ColumnPath path = new ColumnPath(columnFamily);
         path.setColumn(column);
         CTConnection conn = null;
+        CTConnectionPool pool = storeManager.getPool();
         try {
             conn = pool.genericBorrowObject(keyspace);
             Cassandra.Client client = conn.getClient();
             ColumnOrSuperColumn result =
                     client.get(key, path, getTx(txh).getReadConsistencyLevel().getThriftConsistency());
+            storeManager.updateCounter(key);
             return result.getColumn().bufferForValue();
         } catch (NotFoundException e) {
             return null;
@@ -208,10 +231,12 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
         SlicePredicate predicate = new SlicePredicate();
         predicate.setColumn_names(Arrays.asList(column.duplicate()));
         CTConnection conn = null;
+        CTConnectionPool pool = storeManager.getPool();
         try {
             conn = pool.genericBorrowObject(keyspace);
             Cassandra.Client client = conn.getClient();
             List<?> result = client.get_slice(key, parent, predicate, consistency);
+            storeManager.updateCounter(key);
             return 0 < result.size();
         } catch (Exception ex) {
             throw convertException(ex);
@@ -230,6 +255,7 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
     @Override
     public RecordIterator<ByteBuffer> getKeys(StoreTransaction txh) throws StorageException {
         CTConnection conn = null;
+        CTConnectionPool pool = storeManager.getPool();
 
         final IPartitioner<?> partitioner = storeManager.getCassandraPartitioner();
 
@@ -282,6 +308,8 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
                     // nothing to clean-up here
                 }
             };
+            
+            // Updating counters doesn't really matter for random/murmur3 at the moment
         } catch (Exception e) {
             throw convertException(e);
         } finally {

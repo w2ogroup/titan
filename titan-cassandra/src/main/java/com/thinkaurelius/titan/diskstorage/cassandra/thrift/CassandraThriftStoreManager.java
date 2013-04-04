@@ -9,9 +9,12 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.thrift.Cassandra;
 import org.apache.cassandra.thrift.CfDef;
 import org.apache.cassandra.thrift.Column;
@@ -42,10 +45,12 @@ import com.thinkaurelius.titan.diskstorage.cassandra.AbstractCassandraStoreManag
 import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnection;
 import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnectionFactory;
 import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnectionFactory.Config;
-import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.UncheckedGenericKeyedObjectPool;
+import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnectionPool;
 import com.thinkaurelius.titan.diskstorage.keycolumnvalue.Entry;
 import com.thinkaurelius.titan.diskstorage.keycolumnvalue.KCVMutation;
 import com.thinkaurelius.titan.diskstorage.keycolumnvalue.StoreTransaction;
+import com.thinkaurelius.titan.diskstorage.util.ByteBufferUtil;
+import com.thinkaurelius.titan.diskstorage.util.Hex;
 import com.thinkaurelius.titan.diskstorage.util.TimeUtility;
 import com.thinkaurelius.titan.graphdb.configuration.GraphDatabaseConfiguration;
 import com.thinkaurelius.titan.util.system.IOUtils;
@@ -63,7 +68,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 
 	private final Map<String, CassandraThriftKeyColumnValueStore> openStores;
 
-	private final UncheckedGenericKeyedObjectPool<String, CTConnection> pool;
+	private final CTConnectionPool pool;
 	private final CTConnectionFactory factory;
 
 	public CassandraThriftStoreManager(Configuration config)
@@ -83,8 +88,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 		this.factory = new CTConnectionFactory(randomInitialHostname, port,
 				thriftTimeoutMS, thriftFrameSize, thriftMaxMessageSize);
 
-		UncheckedGenericKeyedObjectPool<String, CTConnection> p = new UncheckedGenericKeyedObjectPool<String, CTConnection>(
-				factory);
+		CTConnectionPool p = new CTConnectionPool(factory);
 		p.setTestOnBorrow(true);
 		p.setTestOnReturn(true);
 		p.setTestWhileIdle(false);
@@ -96,8 +100,11 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 
 		this.openStores = new HashMap<String, CassandraThriftKeyColumnValueStore>();
 
-		this.backgroundThread = new Thread(new HostUpdater());
-		this.backgroundThread.start();
+		// Only watch the ring and change endpoints with BOP
+		if (getCassandraPartitioner() instanceof ByteOrderedPartitioner) {
+			this.backgroundThread = new Thread(new HostUpdater());
+			this.backgroundThread.start();
+		}
 	}
 
 	@Override
@@ -126,8 +133,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 	@Override
 	public void close() throws StorageException {
 		openStores.clear();
-		// Do NOT close pool as this may cause subsequent pool operations to
-		// fail!
+		closePool();
 	}
 
 	@Override
@@ -210,8 +216,8 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 			Cassandra.Client client = conn.getClient();
 
 			client.batch_mutate(batch, consistency);
-			ByteBuffer endToken = getKeyEndToken(firstKey);
-			countsByEndToken.get(endToken).update();
+			if (null != firstKey)
+				updateCounter(firstKey);
 		} catch (Exception ex) {
 			throw CassandraThriftKeyColumnValueStore.convertException(ex);
 		} finally {
@@ -222,11 +228,110 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 	}
 
 	public ByteBuffer getKeyEndToken(ByteBuffer key) {
-		throw new UnsupportedOperationException("Not implemented"); // TODO
+		
+		ImmutableMap<ByteBuffer, String> tokenMap = nodesByEndToken;
+		
+		return getKeyEndToken(key, tokenMap);
+	}
+	
+	private ByteBuffer getKeyEndToken(ByteBuffer key, ImmutableMap<ByteBuffer, String> tokenMap) {
+		
+		if (0 == tokenMap.size()) {
+			return null;
+		}
+		
+		ByteBuffer lastToken = null;
+		ByteBuffer result = null;
+		
+		for (ByteBuffer curToken : tokenMap.keySet()) {
+			if (null == lastToken) { // Special case for first iteration
+				if (ByteBufferUtil.isSmallerOrEqualThan(key, curToken)) {
+					// This key is part of the "wrapping range"
+					result = curToken;
+					
+					if (log.isTraceEnabled()) {
+						log.trace("Key {} precedes or equals first token {}",
+								ByteBufferUtil.bytesToHex(key),
+								ByteBufferUtil.bytesToHex(curToken));
+					}
+					
+					break;
+				}
+			} else if (ByteBufferUtil.isSmallerOrEqualThan(key, curToken) &&
+				ByteBufferUtil.isSmallerThan(lastToken, key)) { // General case
+				result = curToken;
+				
+				if (log.isTraceEnabled()) {
+					log.trace("Key {} falls between tokens {} and {}", new Object[] {
+							ByteBufferUtil.bytesToHex(key),
+							ByteBufferUtil.bytesToHex(lastToken),
+							ByteBufferUtil.bytesToHex(curToken)
+					});
+				}
+				
+				break;
+			}
+			
+			lastToken = curToken;
+		}
+		
+		// Wrapping range case 2: key is greater than all tokens
+		if (result == null) {
+			assert 0 < tokenMap.size();
+			assert null != lastToken;
+			
+			result = tokenMap.keySet().iterator().next();
+			
+			assert null != result;
+
+			if (log.isTraceEnabled()) {
+				log.trace("Key {} succeeds all tokens (last token was {}); "
+					+ "assigning it to initial token {}",
+					new Object[] {
+							ByteBufferUtil.bytesToHex(key),
+							ByteBufferUtil.bytesToHex(lastToken),
+							ByteBufferUtil.bytesToHex(result)
+					}
+				);
+			}
+		}
+		
+		return result;
 	}
 
 	public String getKeyHostname(ByteBuffer key) {
-		throw new UnsupportedOperationException("Not implemented"); // TODO
+		
+		ImmutableMap<ByteBuffer, String> tokenMap = nodesByEndToken;
+		
+		ByteBuffer bb = getKeyEndToken(key, tokenMap);
+		
+		return null == bb ? null : tokenMap.get(bb);
+	}
+	
+	public void updateCounter(ByteBuffer key) {
+		ByteBuffer token = getKeyEndToken(key);
+		
+		if (null == token) {
+			if (log.isDebugEnabled()) {
+				log.debug("No token found for key {} (skipping counter update)", 
+						ByteBufferUtil.bytesToHex(key));
+			}
+			return;
+		}
+		
+        Counter c = countsByEndToken.get(token);
+        if (null == c) {
+            countsByEndToken.putIfAbsent(token, new Counter());
+            c = countsByEndToken.get(token);
+        }
+        assert null != c;
+        
+        c.update();
+        
+        if (log.isTraceEnabled()) {
+        	log.trace("Updated counter for token {} (responsible for key {})",
+        			ByteBufferUtil.bytesToHex(token), ByteBufferUtil.bytesToHex(key));
+        }
 	}
 
 	@Override
@@ -234,6 +339,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 	// to use ConcurrentLinkedHashMap
 	public synchronized CassandraThriftKeyColumnValueStore openDatabase(
 			final String name) throws StorageException {
+		
 		if (openStores.containsKey(name))
 			return openStores.get(name);
 
@@ -241,7 +347,9 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 
 		CassandraThriftKeyColumnValueStore store = new CassandraThriftKeyColumnValueStore(
 				keySpaceName, name, this);
+		
 		openStores.put(name, store);
+		
 		return store;
 	}
 
@@ -296,7 +404,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 		}
 	}
 	
-	UncheckedGenericKeyedObjectPool<String, CTConnection> getPool() {
+	CTConnectionPool getPool() {
 		return pool;
 	}
 
@@ -304,7 +412,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 			throws NotFoundException, InvalidRequestException, TException,
 			SchemaDisagreementException, StorageException {
 
-		CTConnection connection = pool.genericBorrowObject(keyspaceName);
+		CTConnection connection = pool.genericBorrowObject(SYSTEM_KS);
 
 		Preconditions.checkNotNull(connection);
 
@@ -313,6 +421,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 
 			try {
 				client.set_keyspace(keyspaceName);
+				client.set_keyspace(SYSTEM_KS);
 				log.debug("Found existing keyspace {}", keyspaceName);
 			} catch (InvalidRequestException e) {
 				// Keyspace didn't exist; create it
@@ -503,18 +612,31 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 
 	private Thread backgroundThread = null;
 
-	private NonBlockingHashMap<ByteBuffer, Counter> countsByEndToken = new NonBlockingHashMap<ByteBuffer, Counter>();
+	private final NonBlockingHashMap<ByteBuffer, Counter> countsByEndToken = new NonBlockingHashMap<ByteBuffer, Counter>();
+	private volatile ImmutableMap<ByteBuffer, String> nodesByEndToken = ImmutableMap.of();
 
 	private void updatePools() throws InterruptedException {
-
+	
 		ByteBuffer hottestEndToken = null;
-		double hottestEndTokenValue = 0.0;
+		double hottestEndTokenValue = 0D;
+		
+		/*
+		 * Count the number of iterations over countsByEndToken.entrySet()'s
+		 * members and store the result in perceivedEntrySetSize. We do this
+		 * instead of just calling countsByEntrySet.size() later because the map
+		 * contents and size could change between the invocation of entrySet()
+		 * and the later line of code where we want to know how large the entry
+		 * set was.
+		 */
+		int perceivedEntrySetSize = 0;
+		
 		for (Map.Entry<ByteBuffer, Counter> entry : countsByEndToken.entrySet()) {
 			if (hottestEndToken == null
 					|| hottestEndTokenValue < entry.getValue().currentValue()) {
 				hottestEndToken = entry.getKey();
 				hottestEndTokenValue = entry.getValue().currentValue();
 			}
+			perceivedEntrySetSize++;
 		}
 
 		// Talk directly to the first replica responsible for the hot token
@@ -545,34 +667,92 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 
 				assert !newConfig.equals(cfg);
 
-				/*
-				 * pool.close() does not affect borrowed connections.
-				 * 
-				 * Connections currently borrowed by some thread which are
-				 * talking to the old host will eventually be destroyed by
-				 * CTConnectionFactory#validateObject() returning false when
-				 * those connections are returned to the pool.
-				 */
-				try {
-					pool.close();
-				} catch (Exception e) {
-					log.warn("Failed to close connection pooler.  "
-							+ "We might be leaking Cassandra connections.", e);
-					// There's still hope: CTConnectionFactory#validateObject()
-					// will be called on borrow() and might tear down the
-					// connections that close() failed to tear down
-				}
+				closePool();
 				log.info("Directing all future Cassandra ops to {}", hotHost);
 			}
+		} else {
+			log.debug("No hottest end token found.  countsByEndToken size={}",
+					perceivedEntrySetSize);
 		}
 	}
 
+	private void closePool() {
+		/*
+		 * pool.close() does not affect borrowed connections.
+		 * 
+		 * Connections currently borrowed by some thread which are
+		 * talking to the old host will eventually be destroyed by
+		 * CTConnectionFactory#validateObject() returning false when
+		 * those connections are returned to the pool.
+		 */
+		try {
+			pool.close();
+			log.info("Closed Thrift connection pooler.");
+		} catch (Exception e) {
+			log.warn("Failed to close connection pooler.  "
+					+ "We might be leaking Cassandra connections.", e);
+			// There's still hope: CTConnectionFactory#validateObject()
+			// will be called on borrow() and might tear down the
+			// connections that close() failed to tear down
+		}
+	}
+	
 	/**
 	 * Refresh instance variables about the Cassandra ring so that
 	 * #getKeyHostname and #getKeyEndToken return up-to-date information.
 	 */
 	private void updateRing() {
-		throw new UnsupportedOperationException("Not implemented"); // TODO
+		
+		CTConnection conn = null;
+		
+		try {
+			conn = pool.genericBorrowObject(SYSTEM_KS);
+			
+			Map<String, String> tm = conn.getClient().describe_token_map();
+			
+			ImmutableMap.Builder<ByteBuffer, String> builder =
+					ImmutableMap.builder();
+			
+			for (Map.Entry<String, String> ent : tm.entrySet()) {
+				String token = ent.getKey();
+				String nodeIP = ent.getKey();
+				
+				ByteBuffer tokenBB = ByteBuffer.wrap(Hex.hexToBytes(token));
+				
+				builder.put(tokenBB, nodeIP);
+			}
+			
+			// Publish fully-formed ring map to its volatile reference
+			nodesByEndToken = builder.build();
+			
+			if (log.isDebugEnabled()) {
+				log.debug("Updated Cassandra TokenMap:");
+				for (Map.Entry<ByteBuffer, String> ent : nodesByEndToken.entrySet()) {
+					log.debug("TokenMap entry: {} -> {}",
+							ByteBufferUtil.bytesToHex(ent.getKey()),
+							ent.getValue());
+				}
+				log.debug("End of Cassandra TokenMap.");
+			}
+		} catch (StorageException e) {
+			log.error("Failed to acquire pooled Cassandra connection", e);
+			// Don't propagate exception
+		} catch (InvalidRequestException e) {
+			log.error("Failed to describe Cassandra token map", e);
+			// Don't propagate exception
+		} catch (TException e) {
+			log.error("Thrift Exception while getting Cassandra token map", e);
+			// Don't propagate exception
+		} finally {
+            if (conn != null) {
+            	try {
+            		pool.genericReturnObject(SYSTEM_KS, conn);
+            	} catch (StorageException e) {
+            		log.warn("Failed to return Cassandra connection to pool." +
+            				"  We might be leaking connections.", e);
+            	}
+            }
+		}
 	}
 
 	private class HostUpdater implements Runnable {
@@ -600,6 +780,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 					updateRing();
 					updatePools();
 					lastUpdateTime = System.currentTimeMillis();
+					log.debug("HostUpdater lastUpdateTime={}", lastUpdateTime);
 				} catch (InterruptedException e) {
 					log.info("Background update thread shutting down...");
 					return;

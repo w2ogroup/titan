@@ -1,20 +1,5 @@
 package com.thinkaurelius.titan.diskstorage.cassandra;
 
-import com.thinkaurelius.titan.CassandraStorageSetup;
-import com.thinkaurelius.titan.core.TitanException;
-import com.thinkaurelius.titan.diskstorage.StorageException;
-import com.thinkaurelius.titan.diskstorage.TemporaryStorageException;
-import com.thinkaurelius.titan.diskstorage.cassandra.embedded.CassandraDaemonWrapper;
-import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnection;
-import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnectionFactory;
-import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnectionPool;
-import com.thinkaurelius.titan.graphdb.configuration.GraphDatabaseConfiguration;
-import org.apache.commons.io.FileUtils;
-import org.apache.commons.lang.StringUtils;
-import org.apache.thrift.transport.TTransportException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
@@ -29,6 +14,21 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang.StringUtils;
+import org.apache.thrift.transport.TTransportException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.thinkaurelius.titan.CassandraStorageSetup;
+import com.thinkaurelius.titan.core.TitanException;
+import com.thinkaurelius.titan.diskstorage.StorageException;
+import com.thinkaurelius.titan.diskstorage.TemporaryStorageException;
+import com.thinkaurelius.titan.diskstorage.cassandra.embedded.CassandraDaemonWrapper;
+import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnection;
+import com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool.CTConnectionFactory;
+import com.thinkaurelius.titan.graphdb.configuration.GraphDatabaseConfiguration;
 
 public class CassandraProcessStarter {
     private Process cassandraProcess;
@@ -185,7 +185,6 @@ public class CassandraProcessStarter {
 			 * destroy stale connections can cause odd failures.
 			 */
             log.debug("Clearing pooled Thrift connections for {}:{}", address, port);
-            CTConnectionPool.clearPool(address, port, GraphDatabaseConfiguration.CONNECTION_TIMEOUT_DEFAULT);
         } catch (Exception e) {
             e.printStackTrace();
             throw new TitanException(e);
@@ -218,12 +217,11 @@ public class CassandraProcessStarter {
     }
 
     public void waitForClusterSize(int minSize) throws InterruptedException, StorageException {
-        CTConnectionFactory f = CTConnectionPool.getFactory(address,
-                                                            port,
-                                                            GraphDatabaseConfiguration.CONNECTION_TIMEOUT_DEFAULT,
-                                                            AbstractCassandraStoreManager.THRIFT_DEFAULT_FRAME_SIZE,
-                                                            AbstractCassandraStoreManager.THRIFT_DEFAULT_MAX_MESSAGE_SIZE);
-        CTConnection conn = null;
+		CTConnectionFactory f = new CTConnectionFactory(address, port,
+				GraphDatabaseConfiguration.CONNECTION_TIMEOUT_DEFAULT,
+				AbstractCassandraStoreManager.THRIFT_DEFAULT_FRAME_SIZE,
+				AbstractCassandraStoreManager.THRIFT_DEFAULT_MAX_MESSAGE_SIZE);
+		CTConnection conn = null;
         try {
             conn = f.makeRawConnection();
             CTConnectionFactory.waitForClusterSize(conn.getClient(), minSize);

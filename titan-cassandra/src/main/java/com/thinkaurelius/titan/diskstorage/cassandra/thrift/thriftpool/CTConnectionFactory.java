@@ -76,7 +76,7 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
      * @return A CTConnection ready to talk to a Cassandra cluster
      * @throws TTransportException on any Thrift transport failure
      */
-    private CTConnection makeRawConnection() throws TTransportException {
+    public CTConnection makeRawConnection() throws TTransportException {
     	Config cfg = cfgRef.get();
     	
         log.debug("Creating TSocket({}, {}, {})", new Object[]{cfg.hostname, cfg.port, cfg.timeoutMS});

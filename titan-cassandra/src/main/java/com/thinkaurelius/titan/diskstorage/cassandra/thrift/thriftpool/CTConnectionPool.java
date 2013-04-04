@@ -1,5 +1,6 @@
 package com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool;
 
+import org.apache.commons.pool.KeyedPoolableObjectFactory;
 import org.apache.commons.pool.impl.GenericKeyedObjectPool;
 
 import java.util.concurrent.ConcurrentHashMap;
@@ -12,10 +13,14 @@ import static com.thinkaurelius.titan.diskstorage.cassandra.AbstractCassandraSto
  *
  * @author Dan LaRocque <dalaro@hopcount.org>
  */
-public class CTConnectionPool {
+public class CTConnectionPool extends UncheckedGenericKeyedObjectPool<String, CTConnection> {
 
     public static final long SCHEMA_WAIT_MAX = 5000;
     public static final long SCHEMA_WAIT_INCREMENT = 25;
+    
+	public CTConnectionPool(KeyedPoolableObjectFactory factory) {
+		super(factory);
+	}
 
 //    private static final ConcurrentHashMap<PoolKey, CTConnectionFactory>
 //            factories = new ConcurrentHashMap<PoolKey, CTConnectionFactory>();

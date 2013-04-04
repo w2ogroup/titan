@@ -53,6 +53,15 @@ public class UncheckedGenericKeyedObjectPool<K, V> extends GenericKeyedObjectPoo
             throw new PermanentStorageException(e);
         }
     }
+    
+    @Override
+    public void invalidateObject(Object key, Object o) throws StorageException {
+    	try {
+    		super.invalidateObject(key, o);
+    	} catch (Exception e) {
+    		throw new PermanentStorageException(e);
+    	}
+    }
 
     /**
      * This method internally calls {@link #borrowObject(Object)}
@@ -76,5 +85,9 @@ public class UncheckedGenericKeyedObjectPool<K, V> extends GenericKeyedObjectPoo
 
     public void genericReturnObject(K key, V o) throws StorageException {
         returnObject(key, o);
+    }
+    
+    public void genericInvalidateObject(K key, V o) throws StorageException {
+    	invalidateObject(key, o);
     }
 }

@@ -1,12 +1,6 @@
 package com.thinkaurelius.titan.diskstorage.cassandra.thrift.thriftpool;
 
 import org.apache.commons.pool.KeyedPoolableObjectFactory;
-import org.apache.commons.pool.impl.GenericKeyedObjectPool;
-
-import java.util.concurrent.ConcurrentHashMap;
-
-import static com.thinkaurelius.titan.diskstorage.cassandra.AbstractCassandraStoreManager.THRIFT_DEFAULT_FRAME_SIZE;
-import static com.thinkaurelius.titan.diskstorage.cassandra.AbstractCassandraStoreManager.THRIFT_DEFAULT_MAX_MESSAGE_SIZE;
 
 /**
  * Cassandra-Thrift connection pooler classes using Apache commons-pool.

@@ -158,6 +158,10 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
             
             return result;
         } catch (Exception e) {
+        	if (null != conn) {
+        		pool.genericInvalidateObject(keyspace, conn);
+        		conn = null;
+        	}
             throw convertException(e);
         } finally {
             if (null != conn)
@@ -190,6 +194,10 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
             storeManager.updateCounter(key);
             return 0 < result.size();
         } catch (Exception e) {
+        	if (null != conn) {
+        		pool.genericInvalidateObject(keyspace, conn);
+        		conn = null;
+        	}
             throw convertException(e);
         } finally {
             if (null != conn)
@@ -215,6 +223,10 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
         } catch (NotFoundException e) {
             return null;
         } catch (Exception e) {
+        	if (null != conn) {
+        		pool.genericInvalidateObject(keyspace, conn);
+        		conn = null;
+        	}
             throw convertException(e);
         } finally {
             if (null != conn)
@@ -239,6 +251,10 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
             storeManager.updateCounter(key);
             return 0 < result.size();
         } catch (Exception ex) {
+        	if (null != conn) {
+        		pool.genericInvalidateObject(keyspace, conn);
+        		conn = null;
+        	}
             throw convertException(ex);
         } finally {
             if (null != conn)
@@ -311,6 +327,10 @@ public class CassandraThriftKeyColumnValueStore implements KeyColumnValueStore {
             
             // Updating counters doesn't really matter for random/murmur3 at the moment
         } catch (Exception e) {
+        	if (null != conn) {
+        		pool.genericInvalidateObject(keyspace, conn);
+        		conn = null;
+        	}
             throw convertException(e);
         } finally {
             if (conn != null)

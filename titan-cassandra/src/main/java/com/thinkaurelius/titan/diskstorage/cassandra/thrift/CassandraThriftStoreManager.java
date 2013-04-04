@@ -9,12 +9,15 @@ import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.Comparator;
 
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.thrift.Cassandra;
 import org.apache.cassandra.thrift.CfDef;
 import org.apache.cassandra.thrift.Column;
@@ -92,7 +95,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 		p.setTestOnBorrow(true);
 		p.setTestOnReturn(true);
 		p.setTestWhileIdle(false);
-		p.setWhenExhaustedAction(GenericKeyedObjectPool.WHEN_EXHAUSTED_GROW);
+		p.setWhenExhaustedAction(GenericKeyedObjectPool.WHEN_EXHAUSTED_BLOCK);
 		p.setMaxActive(-1); // "A negative value indicates no limit"
 		p.setMaxTotal(maxTotalConnections); // maxTotal limits active + idle
 
@@ -134,6 +137,9 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 	public void close() throws StorageException {
 		openStores.clear();
 		closePool();
+		if (null != backgroundThread && backgroundThread.isAlive()) {
+			backgroundThread.interrupt();
+		}
 	}
 
 	@Override
@@ -219,6 +225,10 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 			if (null != firstKey)
 				updateCounter(firstKey);
 		} catch (Exception ex) {
+        	if (null != conn) {
+        		pool.genericInvalidateObject(keySpaceName, conn);
+        		conn = null;
+        	}
 			throw CassandraThriftKeyColumnValueStore.convertException(ex);
 		} finally {
 			if (null != conn)
@@ -605,10 +615,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 	}
 
 	private static final double DECAY_EXPONENT_MULTI = 0.0005;
-	private static final int BG_THREAD_WAIT_TIME = 200;
-	private static final int MAX_CLOSE_ATTEMPTS = 5;
-	private static final int DEFAULT_UPDATE_INTERVAL = 4000
-			+ BG_THREAD_WAIT_TIME * MAX_CLOSE_ATTEMPTS;
+	private static final int DEFAULT_HOST_UPDATE_INTERVAL_MS = 10000;
 
 	private Thread backgroundThread = null;
 
@@ -663,11 +670,21 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 				Config newConfig = new Config(hotHost, cfg.getPort(),
 						cfg.getTimeoutMS(), cfg.getFrameSize(),
 						cfg.getMaxMessageSize());
-				factory.setConfig(newConfig);
 
 				assert !newConfig.equals(cfg);
 
-				closePool();
+				/*
+				 * Destroy idle connections to the old host. This step is not
+				 * strictly necessary so long as pool#getTestOnBorrow() is true.
+				 * This step just eagerly destroys the idle connections, whereas
+				 * without this step the pool would detect and destroy
+				 * connections to the old host lazily (one-by-one as the pool
+				 * handled borrow requests).
+				 */
+				pool.clear();
+				// Set the new hostname on the pool's connection factory
+				factory.setConfig(newConfig);
+				
 				log.info("Directing all future Cassandra ops to {}", hotHost);
 			}
 		} else {
@@ -709,22 +726,38 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 			conn = pool.genericBorrowObject(SYSTEM_KS);
 			
 			Map<String, String> tm = conn.getClient().describe_token_map();
+
+			Pattern p = Pattern.compile("Token\\(bytes\\[(.+)\\]\\)");
 			
-			ImmutableMap.Builder<ByteBuffer, String> builder =
-					ImmutableMap.builder();
+			// Build a temporary TreeMap of ordered tokens and their replica IPs
+			SortedMap<ByteBuffer, String> sortedMap =
+					new TreeMap<ByteBuffer, String>(new Comparator<ByteBuffer>() {
+
+				@Override
+				public int compare(ByteBuffer a, ByteBuffer b) {
+					return ByteBufferUtil.compare(a, b);
+				}
+				
+			});
 			
 			for (Map.Entry<String, String> ent : tm.entrySet()) {
-				String token = ent.getKey();
-				String nodeIP = ent.getKey();
+				// The raw token string has the form "Token(bytes[8000000000000000])"
+				// Strip off the Token(bytes[]) part
+				String rawToken = ent.getKey();
+				Matcher m = p.matcher(rawToken);
+				Preconditions.checkArgument(m.matches());
+				String token = m.group(1);
+				String nodeIP = ent.getValue();
 				
 				ByteBuffer tokenBB = ByteBuffer.wrap(Hex.hexToBytes(token));
 				
-				builder.put(tokenBB, nodeIP);
+				sortedMap.put(tokenBB, nodeIP);
 			}
 			
-			// Publish fully-formed ring map to its volatile reference
-			nodesByEndToken = builder.build();
-			
+			// Copy temporary sorted-by-token map to an ImmutableMap
+			// and publish the ImmutableMap to a volatile reference
+			nodesByEndToken = ImmutableMap.copyOf(sortedMap);		
+						
 			if (log.isDebugEnabled()) {
 				log.debug("Updated Cassandra TokenMap:");
 				for (Map.Entry<ByteBuffer, String> ent : nodesByEndToken.entrySet()) {
@@ -761,7 +794,7 @@ public class CassandraThriftStoreManager extends AbstractCassandraStoreManager {
 		private final long updateInterval;
 
 		public HostUpdater() {
-			this(DEFAULT_UPDATE_INTERVAL);
+			this(DEFAULT_HOST_UPDATE_INTERVAL_MS);
 		}
 
 		public HostUpdater(final long updateInterval) {

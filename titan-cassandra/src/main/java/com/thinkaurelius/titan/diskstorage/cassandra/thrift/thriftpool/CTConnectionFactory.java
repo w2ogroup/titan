@@ -105,7 +105,19 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
     public boolean validateObject(Object key, Object o) {
         CTConnection conn = (CTConnection) o;
         
-        return conn.getConfig().equals(cfgRef.get());
+        Config curCfg = cfgRef.get();
+        
+        boolean result = conn.getConfig().equals(curCfg);
+        
+        if (result) {
+        	log.debug("Validated Thrift connection {}", conn);
+        } else {
+        	if (log.isDebugEnabled())
+        		log.debug("Rejected Thrift connection {}; current config is {}; connection config is {}",
+        			new Object[] {conn, curCfg, conn.getConfig()});
+        }
+        
+        return result;
     }
     
     public Config getConfig() {
@@ -114,6 +126,10 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
     
     public void setConfig(Config newCfg) {
     	cfgRef.set(newCfg);
+    	
+    	if (log.isDebugEnabled()) {
+    		log.debug("Updated Thrift connection factory config to {}", newCfg);
+    	}
     }
 
     /* This method was adapted from cassandra 0.7.5 cli/CliClient.java */
@@ -150,13 +166,13 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
                                 ((InvalidRequestException) e).getWhy() : e.getMessage()));
             }
 
-            int nodeCount = 0;
+//            int nodeCount = 0;
             // Check schema version
             UUID benchmark = UUID.fromString(currentVersionId);
             ByteBuffer benchmarkBB = ti.decompose(benchmark);
             for (String version : versions.keySet()) {
                 if (version.equals(StorageProxy.UNREACHABLE)) {
-                    nodeCount += versions.get(version).size();
+//                    nodeCount += versions.get(version).size();
                     continue;
                 }
 
@@ -164,7 +180,7 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
                 ByteBuffer uuidBB = ti.decompose(uuid);
                 if (-1 < ti.compare(uuidBB, benchmarkBB)) {
                     log.debug("Version {} equals or comes after required version {}", uuid, benchmark);
-                    nodeCount += versions.get(version).size();
+//                    nodeCount += versions.get(version).size();
                     continue;
                 }
                 continue outer;
@@ -281,6 +297,13 @@ public class CTConnectionFactory implements KeyedPoolableObjectFactory {
 
 		public int getMaxMessageSize() {
 			return maxMessageSize;
+		}
+
+		@Override
+		public String toString() {
+			return "Config [hostname=" + hostname + ", port=" + port
+					+ ", timeoutMS=" + timeoutMS + ", frameSize=" + frameSize
+					+ ", maxMessageSize=" + maxMessageSize + "]";
 		}
     }
 }
